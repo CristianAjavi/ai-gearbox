@@ -1,0 +1,37 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  suite:
+    name: ${{ matrix.os }} · Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+        python: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Lint
+        run: |
+          python -m pip install --quiet pyflakes
+          python -m pyflakes gearbox.py test_gearbox.py mutants.py
+      - name: Unit tests
+        env:
+          GEARBOX_IGNORE_HOST: "1"
+        run: python -m unittest -v test_gearbox
+      - name: Mutant bank
+        if: matrix.python == '3.12'
+        env:
+          GEARBOX_IGNORE_HOST: "1"
+        run: python mutants.py
