@@ -223,6 +223,7 @@ class Handoff(Base):
         self.assertIn("`ls engines/`", t)
         self.assertIn("gearbox --read claude aaaa1111", t)
         self.assertIn("Target: codex", t)
+        self.assertIn("run exactly that shell command right away", t)
 
     def test_nested_handoff_is_omitted(self):
         write_claude(self.home)
@@ -417,11 +418,15 @@ class Loop(Base):
         self.assertIn("Handoff claude → codex", err)
         self.assertEqual(len(os.listdir(os.path.join(self.home, ".gearbox", "handoffs"))), 1)
 
-    def test_no_session_starts_without_handoff(self):
+    def test_no_session_starts_without_handoff_but_with_the_switch_rule(self):
         rc, launched, err = self._run_loop("codex", ["agy", "quit"])
         self.assertEqual(rc, 0)
-        self.assertEqual([c for c, _ in launched], [["codex"], ["agy"]])
+        self.assertEqual([c for c, _ in launched], [["codex", gearbox.PRIME], ["agy", "-i", gearbox.PRIME]])
         self.assertIn("starts without a handoff", err)
+
+    def test_claude_clean_launch_has_no_prime(self):
+        rc, launched, _ = self._run_loop("claude", [""])
+        self.assertEqual([c for c, _ in launched], [["claude"]])
 
     def test_ctrl_c_quits(self):
         rc, launched, _ = self._run_loop("agy", [KeyboardInterrupt()])

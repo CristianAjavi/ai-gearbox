@@ -42,6 +42,9 @@ from dataclasses import dataclass, field
 
 TOOLS = ("claude", "codex", "agy")
 MAX_CHARS = 9000            # ≈ 2,200 tokens; the handoff ceiling
+SWITCH_RULE = ("If the user writes just `gearbox claude`, `gearbox codex` or `gearbox agy`, run exactly that shell "
+               "command right away, without asking: it closes this CLI and opens the requested one with a handoff.")
+PRIME = "You are running inside gearbox, which switches between AI CLIs in this same tab. " + SWITCH_RULE
 MARK = "# Session handoff"
 FOREIGN_MARKS = ("# Traspaso de sesión", "I'm continuing a coding session", "## Session Handoff Context")
 GEARBOX_DIR = os.path.join(os.path.expanduser("~"), ".gearbox")
@@ -414,6 +417,7 @@ def build_handoff(s: Session, target: str, max_chars: int = MAX_CHARS) -> str:
             "Continue from the current state. Do not redo what is done or re-ask what is answered.",
             f"If a detail is missing, read the full session with `gearbox --read {s.tool} {s.id}` before asking.",
             "Long-running processes go through `gearbox --bg <cmd>` so they survive the next switch.",
+            SWITCH_RULE,
         ]
         text = "\n".join(parts)
         if len(text) <= max_chars:
@@ -615,7 +619,10 @@ def loop(start: str, cwd: str, ask=input, run=_run_cli, err=sys.stderr, first_pr
     current, prompt = start, first_prompt
     _take_next()                                   # a stale note must not decide the first switch
     while True:
-        run(target_command(current, prompt), cwd=cwd, env={**os.environ, "GEARBOX_LOOP": "1", "GEARBOX_HOST": current})
+        # Codex and agy have no shell prefix: a clean launch gets the switch rule as its first message,
+        # so `gearbox <cli>` typed in the chat is run instead of discussed. Claude Code has `!`.
+        cmd = target_command(current, prompt or (PRIME if current != "claude" else None))
+        run(cmd, cwd=cwd, env={**os.environ, "GEARBOX_LOOP": "1", "GEARBOX_HOST": current})
         answer = _take_next()
         if answer in TOOLS:
             print(f"[gearbox] switch requested from inside {current}: → {answer}", file=err)

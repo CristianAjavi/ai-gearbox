@@ -23,12 +23,14 @@ MUTANTS = [
     ("zombie_counts_as_alive", 'return bool(state) and not state.startswith("Z")', "return True"),
     ("agy_launched_without_-i", 'return ["agy", "-i", prompt]', 'return ["agy", prompt]'),
     ("loop_drops_handoff", "prompt = build_handoff(s, answer)", "prompt = None"),
-    ("loop_launches_blind", "run(target_command(current, prompt), cwd=cwd, env=", "run(target_command(current, None), cwd=cwd, env="),
+    ("loop_launches_blind", 'cmd = target_command(current, prompt or (PRIME if current != "claude" else None))', "cmd = target_command(current, None)"),
     ("loop_ignores_enter", "if answer not in TOOLS:\n                return 0", 'if answer == "quit":\n                return 0'),
     ("loop_ignores_switch_note", "        answer = _take_next()\n        if answer in TOOLS:", "        answer = None\n        if answer in TOOLS:"),
     ("host_not_closed", "    os.kill(host_pid, signal.SIGTERM)\n    for _ in range(30):", "    return\n    for _ in range(30):"),
     ("host_detected_by_any_token", "if os.path.basename(toks[0]) in INTERPRETERS and len(toks) > 1 and not toks[1].startswith(\"-\"):", "if len(toks) > 1:"),
     ("loop_first_handoff_dropped", "return loop(a.loop, cwd, first_prompt=first)", "return loop(a.loop, cwd, first_prompt=None)"),
+    ("clean_launch_without_switch_rule", 'prompt or (PRIME if current != "claude" else None)', "prompt"),
+    ("handoff_without_switch_rule", "            SWITCH_RULE,\n        ]", "        ]"),
 ]
 
 
