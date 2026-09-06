@@ -76,3 +76,7 @@ python3 mutants.py             # mutant bank: every mutant must turn at least on
 It only needs the system's Python 3. The tests create synthetic sessions of the three formats in a
 temporary folder and include negative controls: a folder with no sessions, an unreadable session,
 broken protobuf and a fake target executable.
+
+## License
+
+MIT. See `LICENSE`.
