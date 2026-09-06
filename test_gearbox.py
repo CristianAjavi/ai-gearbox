@@ -131,8 +131,11 @@ class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.home = self.tmp.name
-        self._home_prev = os.environ.get("HOME")
+        self._env_prev = {k: os.environ.get(k) for k in ("HOME", "GEARBOX_IGNORE_HOST", "GEARBOX_LOOP", "GEARBOX_HOST")}
         os.environ["HOME"] = self.home
+        os.environ["GEARBOX_IGNORE_HOST"] = "1"      # the suite itself runs inside a CLI
+        os.environ.pop("GEARBOX_LOOP", None)
+        os.environ.pop("GEARBOX_HOST", None)
         gearbox.GEARBOX_DIR = os.path.join(self.home, ".gearbox")
         self._cwd_prev = os.getcwd()
         os.makedirs(CWD, exist_ok=True)
@@ -140,9 +143,27 @@ class Base(unittest.TestCase):
 
     def tearDown(self):
         os.chdir(self._cwd_prev)
-        if self._home_prev is not None:
-            os.environ["HOME"] = self._home_prev
+        for k, v in self._env_prev.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
         self.tmp.cleanup()
+
+    def sub_env(self, bindir, **extra):
+        """Environment for a subprocess that must see the fake executables and the temporary HOME."""
+        env = {**os.environ, "PATH": bindir + os.pathsep + os.environ["PATH"], "HOME": self.home, **extra}
+        env.pop("GEARBOX_IGNORE_HOST", None)
+        return env
+
+    def fake(self, name, body):
+        bindir = os.path.join(self.home, "bin")
+        os.makedirs(bindir, exist_ok=True)
+        p = os.path.join(bindir, name)
+        with open(p, "w") as fh:
+            fh.write("#!/bin/sh\n" + body + "\n")
+        os.chmod(p, 0o755)
+        return bindir
 
     def run_cli(self, *args):
         out, err = io.StringIO(), io.StringIO()
@@ -373,8 +394,10 @@ class Loop(Base):
                 raise r
             return r
 
-        def run(cmd, cwd=None):
+        def run(cmd, cwd=None, env=None):
             launched.append((cmd, cwd))
+            self.assertEqual(env.get("GEARBOX_LOOP"), "1")
+            self.assertEqual(env.get("GEARBOX_HOST"), cmd[0])
 
         err = io.StringIO()
         rc = gearbox.loop(start, CWD, ask=ask, run=run, err=err)
@@ -425,6 +448,106 @@ class Loop(Base):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertTrue(os.path.exists(os.path.join(self.home, "started.txt")))
         self.assertIn("you left claude", r.stdout)
+
+    def test_loop_first_launch_carries_handoff_with_from(self):
+        """`gearbox --loop codex --from agy`: the first CLI already receives the handoff."""
+        write_agy(self.home)
+        bindir = self.fake("codex", "printf '%s' \"$1\" > \"$HOME/received.md\"")
+        r = subprocess.run([sys.executable, gearbox.__file__, "--loop", "codex", "--from", "agy"], cwd=CWD,
+                           env=self.sub_env(bindir, GEARBOX_IGNORE_HOST="1"), input="\n", capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(os.path.join(self.home, "received.md"), encoding="utf-8") as fh:
+            received = fh.read()
+        self.assertTrue(received.startswith(gearbox.MARK))
+        self.assertIn("Source: agy", received)
+        self.assertIn("Review the payroll transfer", received)
+
+    def test_switch_note_from_inside_skips_the_question(self):
+        write_claude(self.home)
+        launched = []
+
+        def run(cmd, cwd=None, env=None):
+            launched.append(cmd)
+            if cmd[0] == "claude":                      # as if `gearbox codex` had run inside claude
+                os.makedirs(gearbox.GEARBOX_DIR, exist_ok=True)
+                with open(gearbox._next_path(), "w") as fh:
+                    fh.write("codex\n")
+
+        answers = iter([""])
+        asked = []
+
+        def ask(msg):
+            asked.append(msg)
+            return next(answers)
+
+        err = io.StringIO()
+        rc = gearbox.loop("claude", CWD, ask=ask, run=run, err=err)
+        self.assertEqual(rc, 0)
+        self.assertEqual([c[0] for c in launched], ["claude", "codex"])
+        self.assertTrue(launched[1][1].startswith(gearbox.MARK))
+        self.assertEqual(len(asked), 1)                  # asked only after codex, where no note was left
+        self.assertIn("you left codex", asked[0])
+        self.assertIn("switch requested from inside claude", err.getvalue())
+        self.assertFalse(os.path.exists(gearbox._next_path()))
+
+    def test_stale_switch_note_is_ignored(self):
+        os.makedirs(gearbox.GEARBOX_DIR, exist_ok=True)
+        with open(gearbox._next_path(), "w") as fh:
+            fh.write("agy")
+        rc, launched, _ = self._run_loop("codex", [""])
+        self.assertEqual(rc, 0)
+        self.assertEqual([c[0] for c, _ in launched], ["codex"])
+
+
+class Host(Base):
+    def test_tool_of(self):
+        self.assertEqual(gearbox._tool_of("claude", "claude"), "claude")
+        self.assertEqual(gearbox._tool_of("agy", "/usr/local/bin/agy -i hello"), "agy")
+        self.assertEqual(gearbox._tool_of("codex-aarch64-apple-darwin", "/x/codex-aarch64-apple-darwin"), "codex")
+        self.assertEqual(gearbox._tool_of("/bin/sh", "/bin/sh /tmp/bin/agy"), "agy")
+        self.assertEqual(gearbox._tool_of("node", "node /x/node_modules/.bin/codex.js"), "codex")
+        self.assertIsNone(gearbox._tool_of("/bin/sh", "/bin/sh -c gearbox codex"))
+        self.assertIsNone(gearbox._tool_of("python3", "python3 gearbox.py codex"))
+        self.assertIsNone(gearbox._tool_of("gearbox", "gearbox codex"))     # the target is an argument, not the host
+        self.assertIsNone(gearbox._tool_of("/bin/zsh", "-zsh"))
+
+    def test_ignore_host_env(self):
+        self.assertIsNone(gearbox.host_process())
+
+    def test_switch_from_inside_a_loop_closes_the_host(self):
+        """A fake `agy` (a shell script) runs `gearbox codex` as its child, the way an assistant's tool would.
+        gearbox must find agy up the parent chain, leave the note and close it."""
+        write_agy(self.home)
+        bindir = self.fake("agy", f"{sys.executable} {gearbox.__file__} codex 2> \"$HOME/inner.err\"; echo rc=$? > \"$HOME/inner.txt\"; sleep 20")
+        t0 = time.time()
+        r = subprocess.run([os.path.join(bindir, "agy")], env=self.sub_env(bindir, GEARBOX_LOOP="1", GEARBOX_HOST="agy"),
+                           capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, -15, r.stderr)                 # closed by SIGTERM, not by finishing
+        self.assertLess(time.time() - t0, 10)
+        with open(gearbox._next_path(), encoding="utf-8") as fh:
+            self.assertEqual(fh.read().strip(), "codex")
+        self.assertFalse(os.path.exists(os.path.join(self.home, "inner.txt")))   # agy died before the script went on
+        with open(os.path.join(self.home, "inner.err"), encoding="utf-8") as fh:
+            self.assertIn("Switching agy → codex", fh.read())
+
+    def test_inside_a_host_without_loop_is_refused(self):
+        write_agy(self.home)
+        bindir = self.fake("agy", f"{sys.executable} {gearbox.__file__} codex 2> \"$HOME/inner.err\"; echo rc=$? > \"$HOME/inner.txt\"")
+        r = subprocess.run([os.path.join(bindir, "agy")], env=self.sub_env(bindir), capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0)
+        with open(os.path.join(self.home, "inner.txt")) as fh:
+            self.assertEqual(fh.read().strip(), "rc=4")
+        with open(os.path.join(self.home, "inner.err"), encoding="utf-8") as fh:
+            self.assertIn("inside agy, outside a gearbox loop", fh.read())
+        self.assertFalse(os.path.exists(gearbox._next_path()))
+
+    def test_same_tool_as_host_is_refused(self):
+        bindir = self.fake("agy", f"{sys.executable} {gearbox.__file__} agy 2> \"$HOME/inner.err\"; echo rc=$? > \"$HOME/inner.txt\"")
+        subprocess.run([os.path.join(bindir, "agy")], env=self.sub_env(bindir, GEARBOX_LOOP="1"), capture_output=True, text=True, timeout=30)
+        with open(os.path.join(self.home, "inner.txt")) as fh:
+            self.assertEqual(fh.read().strip(), "rc=4")
+        with open(os.path.join(self.home, "inner.err"), encoding="utf-8") as fh:
+            self.assertIn("already inside agy", fh.read())
 
 
 if __name__ == "__main__":

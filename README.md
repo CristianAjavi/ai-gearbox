@@ -25,9 +25,18 @@ gearbox --loop claude          # one tab all day (see below)
 
 ## One tab
 
-`gearbox --loop claude` opens Claude Code. When you leave it, with `/exit` or Ctrl+C, it asks which
-CLI to switch to and opens the next one in the same tab with the handoff of the session you just closed.
-Enter or `quit` ends the loop. No second terminal, no session id to type.
+`gearbox --loop claude` opens Claude Code and keeps the tab. From there you switch in two ways:
+
+- **From inside the chat**: run `gearbox codex` inside the CLI. In Claude Code type `!gearbox codex`;
+  in Codex or agy, which have no shell prefix, ask the assistant to run it. gearbox recognizes the CLI it
+  runs inside, closes it, and the loop opens Codex in the same tab with the handoff of the session just closed.
+- **On exit**: leave the CLI with `/exit` or Ctrl+C and answer the question `Switch to?`.
+
+Enter or `quit` at that question ends the loop. `gearbox --loop codex --from agy` starts the loop with a
+handoff already on board. Outside a loop, `gearbox codex` typed inside a CLI does not switch: the CLI owns
+the terminal, so gearbox tells you to exit it first.
+
+Typing `gearbox codex` into the chat as plain text does nothing: the assistant reads it as a message.
 
 ## What travels
 

@@ -17,6 +17,11 @@ Usage:
   gearbox --jobs                  list background processes and their state
   gearbox --loop claude           one tab all day: when you exit a CLI it asks which
                                   one to switch to and opens it with the handoff
+  gearbox --loop codex --from agy the loop's first launch already carries a handoff
+
+Inside a loop you can also switch without leaving the chat: run `gearbox codex` from
+within the CLI (`!gearbox codex` in Claude Code; in Codex or agy ask the assistant to run
+it). gearbox recognizes the CLI it runs inside, closes it and the loop opens the next one.
 
 Exit codes: 0 ok · 2 no session · 3 session has no readable messages · 4 usage.
 """
@@ -28,9 +33,11 @@ import glob
 import json
 import os
 import re
+import signal
 import sqlite3
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 
 TOOLS = ("claude", "codex", "agy")
@@ -508,19 +515,118 @@ def list_jobs() -> list:
     return out
 
 
-def loop(start: str, cwd: str, ask=input, run=subprocess.run, err=sys.stderr) -> int:
-    """One tab: launch a CLI and, when you exit it, ask which one to switch to and open the next
-    one with the handoff of the session you just closed. Enter, `quit` or Ctrl+C end the loop."""
-    current, prompt = start, None
+INTERPRETERS = {"sh", "bash", "zsh", "dash", "node", "python", "python3", "env"}
+
+
+def _proc(pid: int):
+    """(ppid, comm, command) of a process, or None if it does not exist."""
+    try:
+        out = subprocess.run(["ps", "-o", "ppid=,comm=,command=", "-p", str(pid)],
+                             capture_output=True, text=True, timeout=5).stdout.strip()
+    except Exception:
+        return None
+    parts = out.split(None, 2)
+    if len(parts) < 2:
+        return None
+    return int(parts[0]), parts[1], (parts[2] if len(parts) > 2 else "")
+
+
+def _tool_of(comm: str, command: str) -> str | None:
+    """Which CLI a process is, judged by its executable name; a script run through an interpreter counts too."""
+    names = [os.path.basename(comm)]
+    toks = command.split()
+    if toks:
+        names.append(os.path.basename(toks[0]))
+        if os.path.basename(toks[0]) in INTERPRETERS and len(toks) > 1 and not toks[1].startswith("-"):
+            names.append(os.path.basename(toks[1]))
+    for n in names:
+        for t in TOOLS:
+            if n == t or n.startswith(t + "-") or n.startswith(t + "."):
+                return t
+    return None
+
+
+def host_process(start_pid: int | None = None):
+    """(tool, pid) of the AI CLI this process runs inside, walking up the parent chain; None outside any.
+    GEARBOX_IGNORE_HOST=1 disables the lookup (the test suite runs inside a CLI itself)."""
+    if os.environ.get("GEARBOX_IGNORE_HOST"):
+        return None
+    pid = start_pid or os.getppid()
+    for _ in range(12):
+        if pid <= 1:
+            return None
+        info = _proc(pid)
+        if not info:
+            return None
+        ppid, comm, command = info
+        t = _tool_of(comm, command)
+        if t:
+            return t, pid
+        pid = ppid
+    return None
+
+
+def _next_path() -> str:
+    return os.path.join(GEARBOX_DIR, "next")
+
+
+def request_switch(target: str, host_tool: str, host_pid: int, err=sys.stderr) -> None:
+    """From inside a CLI run by the loop: leave a note for the loop and close the host CLI."""
+    os.makedirs(GEARBOX_DIR, exist_ok=True)
+    with open(_next_path(), "w", encoding="utf-8") as fh:
+        fh.write(target)
+    print(f"Switching {host_tool} → {target}: closing {host_tool}, the loop opens {target} with the handoff.", file=err)
+    os.kill(host_pid, signal.SIGTERM)
+    for _ in range(30):
+        if not _alive(host_pid):
+            return
+        time.sleep(0.1)
+    os.kill(host_pid, signal.SIGKILL)
+
+
+def _take_next() -> str | None:
+    p = _next_path()
+    if not os.path.exists(p):
+        return None
+    with open(p, encoding="utf-8") as fh:
+        nxt = fh.read().strip().lower()
+    os.remove(p)
+    return nxt
+
+
+def _run_cli(cmd: list, cwd: str, env: dict) -> None:
+    """Run a CLI in the foreground. Ctrl+C belongs to the CLI, not to the loop; the terminal is
+    put back in order afterwards in case the CLI was closed from inside."""
+    p = subprocess.Popen(cmd, cwd=cwd, env=env)
     while True:
-        run(target_command(current, prompt), cwd=cwd)
         try:
-            answer = ask(f"[gearbox] you left {current}. Switch to? (claude/codex/agy · Enter = quit) ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            print("", file=err)
-            return 0
-        if answer not in TOOLS:
-            return 0
+            p.wait()
+            break
+        except KeyboardInterrupt:
+            continue
+    if sys.stdin.isatty():
+        subprocess.run(["stty", "sane"], stdin=sys.stdin, check=False)
+
+
+def loop(start: str, cwd: str, ask=input, run=_run_cli, err=sys.stderr, first_prompt: str | None = None) -> int:
+    """One tab: launch a CLI and, when it closes, open the next one with the handoff of the session
+    just closed. The next CLI comes from `gearbox <cli>` run inside the chat, or from the question
+    asked on exit. Enter, `quit` or Ctrl+C at that question end the loop."""
+    current, prompt = start, first_prompt
+    _take_next()                                   # a stale note must not decide the first switch
+    while True:
+        run(target_command(current, prompt), cwd=cwd, env={**os.environ, "GEARBOX_LOOP": "1", "GEARBOX_HOST": current})
+        answer = _take_next()
+        if answer in TOOLS:
+            print(f"[gearbox] switch requested from inside {current}: → {answer}", file=err)
+        else:
+            try:
+                answer = ask(f"[gearbox] you left {current}. Switch to? (claude/codex/agy · Enter = quit) ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print("", file=err)
+                return 0
+            if answer not in TOOLS:
+                return 0
         prompt = None
         s = _find(cwd, current, None)
         if s:
@@ -560,7 +666,18 @@ def main(argv=None) -> int:
     cwd = os.getcwd()
 
     if a.loop:
-        return loop(a.loop, cwd)
+        first = None
+        if a.source or a.session:
+            s = _find(cwd, a.source, a.session)
+            if not s:
+                print("No source session" + (f" from {a.source}" if a.source else "") + " in this folder.", file=sys.stderr)
+                return 2
+            PARSERS[s.tool](s)
+            if s.msgs and s.tool != a.loop:
+                first = build_handoff(s, a.loop, a.max_chars)
+                p = save_handoff(first, s.tool, a.loop)
+                print(f"Handoff {s.tool} → {a.loop}: {len(first)} chars (≈{len(first)//4} tokens), saved at {p}", file=sys.stderr)
+        return loop(a.loop, cwd, first_prompt=first)
 
     if a.jobs:
         recs = list_jobs()
@@ -605,6 +722,19 @@ def main(argv=None) -> int:
 
     if not a.target:
         ap.print_help()
+        return 4
+
+    host = None if a.dry_run else host_process()
+    if host:
+        host_tool, host_pid = host
+        if host_tool == a.target:
+            print(f"You are already inside {host_tool}.", file=sys.stderr)
+            return 4
+        if os.environ.get("GEARBOX_LOOP"):
+            request_switch(a.target, host_tool, host_pid)
+            return 0
+        print(f"You are inside {host_tool}, outside a gearbox loop. Exit {host_tool} and run "
+              f"`gearbox {a.target} --from {host_tool}`, or start next time with `gearbox --loop {host_tool}`.", file=sys.stderr)
         return 4
 
     s = _find(cwd, a.source, a.session)
